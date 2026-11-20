@@ -115,6 +115,7 @@ public:
     std::string reconnectDescription() const {
         return fastReconnect_ ? tabs_->description() : "兼容重连：复用当前测试标签页";
     }
+    std::size_t retiringTabCount() const { return retiringTabs_.size(); }
     void currentChanged(std::uint64_t handler) {
         if (internalGuiCall_.load() || !trackedTabs_.load()) return;
         std::lock_guard<std::mutex> lock(selectionMutex_);
@@ -437,7 +438,8 @@ void updateUi() {
     EnableWindow(GetDlgItem(window, stopId), running);
     EnableWindow(GetDlgItem(window, restoreId), idle && hasSelection);
     setText(statusLabel, controller->cleaning() ? wide(controller->message()) + L"；正在清理连接…" :
-        (!running && !notice.empty() ? notice : wide(controller->message())));
+        (!running && !notice.empty() ? notice : wide(controller->message()) +
+            (running ? L"\r\n" + wide(host.reconnectDescription()) : L"")));
     setText(progressLabel, L"已执行异常断线  " + std::to_wstring(controller->completed()) + L" / " +
         std::to_wstring(controller->total()) + L"    ·    本地保留端点 " + std::to_wstring(controller->retained()));
     SendMessageW(progress, PBM_SETPOS, controller->total()
@@ -705,10 +707,25 @@ void ts3plugin_shutdown() {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+        host.collectRetiredTabs();
 #else
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
 #endif
     });
+#ifdef _WIN32
+    const auto retireDeadline = GetTickCount64() + 8000;
+    while (host.retiringTabCount() && GetTickCount64() < retireDeadline) {
+        host.collectRetiredTabs();
+        MsgWaitForMultipleObjectsEx(0, nullptr, 5, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        MSG message{};
+        bool quitting = false;
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT) { PostQuitMessage(static_cast<int>(message.wParam)); quitting = true; break; }
+            TranslateMessage(&message); DispatchMessageW(&message);
+        }
+        if (quitting) break;
+    }
+#endif
     if (!settled && ts.printMessage)
         ts.printMessage(host.currentHandler(), "Ghost User: disconnect cleanup timed out; disconnect the test tab in TeamSpeak.", PLUGIN_MESSAGE_TARGET_SERVER);
     host.reset();
