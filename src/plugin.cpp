@@ -499,7 +499,7 @@ void selectCurrent() {
     runningSelection = false;
     notice.clear();
     setText(targetLabel, wide(selected.serverName + "   ·   " + ghost::endpoint(selected.connectHost, selected.connectPort)
-        + "\r\n传输 IP：" + ghost::endpoint(selected.address, selected.port) + "  （" + ghost::addressDescription(selected.address) + "）"
+        + "\r\n传输 IP：" + ghost::endpoint(selected.address, selected.port)
         + "\r\n昵称：" + selected.nickname + "    频道：" +
         (selected.channelPath.empty() ? "ID " + std::to_string(selected.channelId) : selected.channelPath)
         + "\r\n身份 UID：" + selected.identityUid));
@@ -730,7 +730,7 @@ void showWindow() {
 
 extern "C" {
 const char* ts3plugin_name() { return "Ghost User"; }
-const char* ts3plugin_version() { return "0.1.6"; }
+const char* ts3plugin_version() { return "0.1.7"; }
 int ts3plugin_apiVersion() { return 26; }
 const char* ts3plugin_author() { return "TS3_GhostUser contributors"; }
 const char* ts3plugin_description() { return "Native GUI for finite connection-timeout tests on your TeamSpeak server."; }
