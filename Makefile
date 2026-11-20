@@ -3,7 +3,7 @@ CXX ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic
 BUILD := build
 VERSION := $(shell awk '$$2 == "VERSION" { print $$3; exit }' CMakeLists.txt)
-CORE := src/controller.cpp src/udp_gate.cpp
+CORE := src/controller.cpp src/udp_gate.cpp src/endpoint.cpp src/gui_tabs.cpp
 HEADERS := $(wildcard src/*.h)
 .PHONY: all test clean
 all: $(BUILD)/ghostuser.so

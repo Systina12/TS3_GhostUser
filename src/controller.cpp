@@ -111,6 +111,8 @@ Target Controller::originalTarget(const Target& observed) const {
         std::any_of(retired_.begin(), retired_.end(), isPort)) {
         result.address = target_.address;
         result.port = target_.port;
+        result.connectHost = target_.connectHost;
+        result.connectPort = target_.connectPort;
     }
     return result;
 }

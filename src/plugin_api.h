@@ -25,6 +25,7 @@ GHOST_EXPORT void ts3plugin_initMenus(PluginMenuItem*** items, char** icon);
 GHOST_EXPORT void ts3plugin_freeMemory(void* data);
 GHOST_EXPORT void ts3plugin_onMenuItemEvent(uint64 handler, PluginMenuType type, int menuId, uint64 item);
 GHOST_EXPORT void ts3plugin_onConnectStatusChangeEvent(uint64 handler, int status, unsigned int error);
+GHOST_EXPORT void ts3plugin_currentServerConnectionChanged(uint64 handler);
 GHOST_EXPORT int ts3plugin_onServerErrorEvent(uint64 handler, const char* message, unsigned int error,
                                             const char* returnCode, const char* extraMessage);
 }
