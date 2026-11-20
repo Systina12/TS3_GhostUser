@@ -23,7 +23,9 @@ struct Target {
     std::uint64_t handler = 0;
     std::uint64_t channelId = 0;
     std::uint16_t port = 0;
+    std::uint16_t connectPort = 0;
     std::string address, serverName, serverUid, identityUid;
+    std::string connectHost;
     std::string nickname, channelPath, serverPassword, channelPassword;
 };
 
@@ -75,6 +77,7 @@ public:
     std::uint64_t total() const { return options_.count; }
     std::size_t retained() const { return retired_.size(); }
     std::uint64_t handler() const { return target_.handler; }
+    std::uint16_t localPort() const { return active_ ? active_->port() : 0; }
     const std::string& message() const { return message_; }
 
 private:

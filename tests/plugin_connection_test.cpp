@@ -20,15 +20,20 @@ struct Tab {
     bool valid = true;
     int status = STATUS_CONNECTION_ESTABLISHED;
     std::string address = "203.0.113.10";
+    std::string connectHost = "voice.example.test";
     uint64 port = 19987, channel = 2;
+    unsigned short connectPort = 19987;
 };
 struct State {
     uint64 current = 1;
     std::map<uint64, Tab> tabs{{1, {}}, {2, {}}};
     bool finishStop = true, moveImmediately = true, failChannelInfo = false;
+    bool allowNewTabs = false;
+    PluginConnectTab lastTabMode = PLUGIN_CONNECT_TAB_CURRENT;
     int stops = 0, cuts = 0, closed = 0, moves = 0;
     std::string connectAddress, connectPath, movePassword;
     uint64 moveChannel = 0;
+    std::string serverUid = "server uid";
     void event(uint64 handler, int status, unsigned int code = ERROR_ok) {
         tabs.at(handler).status = status;
         ts3plugin_onConnectStatusChangeEvent(handler, status, code);
@@ -48,6 +53,27 @@ struct TestFactory final : ghost::GateFactory {
     explicit TestFactory(State& s) : data(s) {}
     std::unique_ptr<ghost::Gate> create(const ghost::Target&) override { return std::make_unique<TestGate>(data); }
 };
+struct TestTabs final : ghost::GuiTabActions {
+    State& data;
+    bool supported = true;
+    int closed = 0;
+    std::map<std::uint64_t, std::uint64_t> tokens;
+    explicit TestTabs(State& s) : data(s) {}
+    bool closeCurrent(std::uint64_t token, const Guard& guard) override {
+        if (!supported || !guard()) return false;
+        tokens[token] = data.current;
+        return true; // Model the GUI's asynchronous close; the old handler stays alive.
+    }
+    ghost::TabCleanup closeInactive(std::uint64_t token, const Guard& guard) override {
+        const auto found = tokens.find(token);
+        if (found == tokens.end()) return ghost::TabCleanup::missing;
+        if (!guard()) return ghost::TabCleanup::kept;
+        data.tabs.at(found->second).valid = false;
+        tokens.erase(found); ++closed;
+        return ghost::TabCleanup::closed;
+    }
+    std::string description() const override { return supported ? "test fast tabs" : "test unsupported GUI"; }
+};
 TS3Functions functions() {
     TS3Functions f{};
     f.getCurrentServerConnectionHandlerID = []() -> uint64 { return state->current; };
@@ -66,7 +92,15 @@ TS3Functions functions() {
     f.guiConnect = [](PluginConnectTab tab, const char*, const char* address, const char*, const char*,
         const char* channel, const char*, const char*, const char*, const char*, const char*, const char*,
         const char*, const char*, uint64* result) -> unsigned int {
-        require(tab == PLUGIN_CONNECT_TAB_CURRENT, "must only use the selected tab");
+        state->lastTabMode = tab;
+        require(tab == PLUGIN_CONNECT_TAB_CURRENT || (state->allowNewTabs && tab == PLUGIN_CONNECT_TAB_NEW),
+            "new tabs require the owned fast-reconnect path");
+        if (tab == PLUGIN_CONNECT_TAB_NEW) {
+            state->current = state->tabs.rbegin()->first + 1;
+            state->tabs.emplace(state->current, Tab{});
+            state->tabs.at(state->current).status = STATUS_DISCONNECTED;
+            ts3plugin_currentServerConnectionChanged(state->current);
+        }
         state->connectAddress = address;
         state->connectPath = channel;
         *result = state->current;
@@ -81,7 +115,7 @@ TS3Functions functions() {
         return copyString(state->tabs.at(handler).address, out);
     };
     f.getServerVariableAsString = [](uint64, size_t flag, char** out) -> unsigned int {
-        return copyString(flag == VIRTUALSERVER_UNIQUE_IDENTIFIER ? "server uid" : "test server", out);
+        return copyString(flag == VIRTUALSERVER_UNIQUE_IDENTIFIER ? state->serverUid : "test server", out);
     };
     f.getClientSelfVariableAsString = [](uint64, size_t flag, char** out) -> unsigned int {
         return copyString(flag == CLIENT_UNIQUE_IDENTIFIER ? "identity uid" : "test user", out);
@@ -89,8 +123,9 @@ TS3Functions functions() {
     f.getChannelOfClient = [](uint64 handler, anyID, uint64* out) -> unsigned int {
         *out = state->tabs.at(handler).channel; return ERROR_ok;
     };
-    f.getServerConnectInfo = [](uint64, char* address, unsigned short* port, char* password, size_t) -> unsigned int {
-        std::strcpy(address, "203.0.113.10"); *port = 19987; *password = '\0'; return ERROR_ok;
+    f.getServerConnectInfo = [](uint64 handler, char* address, unsigned short* port, char* password, size_t) -> unsigned int {
+        std::strcpy(address, state->tabs.at(handler).connectHost.c_str());
+        *port = state->tabs.at(handler).connectPort; *password = '\0'; return ERROR_ok;
     };
     f.getChannelConnectInfo = [](uint64, uint64, char* path, char* password, size_t) -> unsigned int {
         if (state->failChannelInfo) return ERROR_channel_invalid_id;
@@ -129,6 +164,7 @@ struct Fixture {
         controller->start(target, {2, 0, 0}, 0);
         controller->tick(1);
         data.tabs[1].address = "127.0.0.1"; data.tabs[1].port = 40111;
+        data.tabs[1].connectHost = "127.0.0.1"; data.tabs[1].connectPort = 40111;
         data.event(1, STATUS_CONNECTION_ESTABLISHED);
         controller->tick(2); controller->tick(3);
         require(controller->phase() == ghost::Phase::holding, "must establish relay before the test");
@@ -152,6 +188,50 @@ int main() {
         f.data.tabs[1].valid = false;
         require(host.connection(1) == ghost::Connection::disconnected && !host.replacingConnection(1),
             "closed handler must clear its expectation");
+    });
+    test("fast reconnect overlaps GUI cleanup without touching other tabs", [] {
+        Fixture f; f.relay();
+        auto tabs = std::make_unique<TestTabs>(f.data); auto* actions = tabs.get();
+        host.setGuiTabs(std::move(tabs)); host.enableFastReconnect(true); f.data.allowNewTabs = true;
+        controller->tick(4); controller->tick(5);
+        const auto second = controller->handler();
+        require(second == 3 && f.data.current == 3 && f.data.lastTabMode == PLUGIN_CONNECT_TAB_NEW,
+            "must connect in a new tab while the cut old tab is still established");
+        require(f.data.tabs.at(1).status == STATUS_CONNECTION_ESTABLISHED, "must not wait for the old handler");
+        f.data.tabs.at(second).address = "127.0.0.1"; f.data.tabs.at(second).port = 40111;
+        f.data.event(second, STATUS_CONNECTING); f.data.event(second, STATUS_CONNECTION_ESTABLISHED);
+        controller->tick(6); controller->tick(7);
+        f.data.event(1, STATUS_DISCONNECTED, ERROR_connection_lost);
+        require(host.takeError().empty(), "retiring-tab errors must not cancel the new session");
+        host.collectRetiredTabs();
+        require(!f.data.tabs.at(1).valid && actions->closed == 1, "release an owned inactive tab only after disconnect");
+        controller->tick(8); controller->tick(9);
+        const auto restored = controller->handler();
+        require(restored == 4 && f.data.connectAddress == "voice.example.test:19987", "final restore must use a fresh tab and original hostname");
+        f.data.event(restored, STATUS_CONNECTING); f.data.event(restored, STATUS_CONNECTION_ESTABLISHED);
+        controller->tick(10); controller->tick(11);
+        require(!controller->running() && f.data.cuts == 2 && f.data.tabs.at(2).valid &&
+            f.data.tabs.at(2).status == STATUS_CONNECTION_ESTABLISHED, "exact batch and unrelated tab preservation");
+    });
+    test("user selection relinquishes ownership of a retiring tab", [] {
+        Fixture f; f.relay();
+        auto tabs = std::make_unique<TestTabs>(f.data); auto* actions = tabs.get();
+        host.setGuiTabs(std::move(tabs)); host.enableFastReconnect(true); f.data.allowNewTabs = true;
+        controller->tick(4); controller->tick(5);
+        f.data.current = 1; ts3plugin_currentServerConnectionChanged(1);
+        f.data.current = 3; ts3plugin_currentServerConnectionChanged(3);
+        f.data.event(1, STATUS_DISCONNECTED);
+        host.collectRetiredTabs();
+        require(f.data.tabs.at(1).valid && actions->closed == 0,
+            "a tab adopted by the user must never be closed by background cleanup");
+    });
+    test("unavailable GUI bridge falls back to the compatible current-tab route", [] {
+        Fixture f; f.relay();
+        auto tabs = std::make_unique<TestTabs>(f.data); tabs->supported = false;
+        host.setGuiTabs(std::move(tabs)); host.enableFastReconnect(true);
+        controller->tick(4); controller->tick(5);
+        require(controller->handler() == 1 && f.data.lastTabMode == PLUGIN_CONNECT_TAB_CURRENT &&
+            host.reconnectDescription() == "test unsupported GUI", "fallback must preserve the old working route");
     });
     test("closing the test tab allows a new batch in another tab", [] {
         Fixture f;
@@ -187,6 +267,8 @@ int main() {
         Fixture f; f.relay();
         const auto active = readTarget();
         require(active.address == f.target.address && active.port == f.target.port, "active relay must resolve");
+        require(active.connectHost == f.target.connectHost && active.connectPort == f.target.connectPort,
+            "relay GUI metadata must not replace the original hostname");
         controller->tick(4); f.data.finishStop = false; controller->stop();
         const auto stopped = readTarget();
         require(stopped.address == f.target.address && stopped.port == f.target.port, "cut relay must resolve during cleanup");
@@ -203,12 +285,60 @@ int main() {
             f.data.moveImmediately = false;
             controller->restore(target, 10);
             require(f.data.connectPath.empty(), "connect must omit the ambiguous path");
-            f.data.event(1, STATUS_CONNECTION_ESTABLISHED); controller->tick(11); controller->tick(12);
+            f.data.event(1, STATUS_CONNECTING); f.data.event(1, STATUS_CONNECTION_ESTABLISHED);
+            controller->tick(11); controller->tick(12);
             require(controller->running() && f.data.moveChannel == channel && f.data.movePassword == "known password",
                 "manual restore must move by saved ID and password and wait for confirmation");
             f.data.tabs[1].channel = channel; controller->tick(13);
             require(!controller->running() && f.data.cuts == 0, "confirmed restore must finish without cutting");
         }
+    });
+    test("restore keeps the original hostname and accepts a newly resolved IP after a fresh handshake", [] {
+        Fixture f;
+        f.data.tabs[1].address = "198.18.0.1";
+        const auto target = readTarget();
+        require(target.connectHost == "voice.example.test" && target.address == "198.18.0.1",
+            "read must keep the GUI hostname separately from the reported transport IP");
+        f.data.event(1, STATUS_DISCONNECTED);
+        controller->restore(target, 10);
+        require(f.data.connectAddress == "voice.example.test:19987", "restore must use the hostname");
+        f.data.tabs[1].address = "198.18.0.2";
+        f.data.tabs[1].status = STATUS_CONNECTION_ESTABLISHED;
+        controller->tick(11);
+        require(controller->phase() == ghost::Phase::connecting, "stale established status cannot complete a restore");
+        f.data.event(1, STATUS_CONNECTING); f.data.event(1, STATUS_CONNECTION_ESTABLISHED);
+        controller->tick(12); controller->tick(13);
+        require(!controller->running() && f.data.cuts == 0, "same server on a changed IP must restore successfully");
+    });
+    test("restoring a hostname still rejects a different server identity", [] {
+        Fixture f; f.data.event(1, STATUS_DISCONNECTED);
+        controller->restore(f.target, 0);
+        f.data.serverUid = "different server";
+        f.data.event(1, STATUS_CONNECTING); f.data.event(1, STATUS_CONNECTION_ESTABLISHED);
+        controller->tick(1);
+        require(!controller->running() && f.data.cuts == 0 &&
+            controller->message().find("服务器身份不匹配") != std::string::npos,
+            "DNS changes must not bypass server UID verification");
+    });
+    test("IP diagnostics distinguish the reported addresses and omit passwords", [] {
+        Fixture f;
+        require(ghost::addressDescription("192.18.0.1").find("非 RFC 1918") != std::string::npos,
+            "192.18 is not a private or benchmark address");
+        for (const auto ip : {"198.18.0.1", "198.19.255.255"})
+            require(ghost::addressDescription(ip).find("Fake-IP") != std::string::npos, "identify benchmark range");
+        for (const auto ip : {"192.168.0.1", "10.0.0.1", "172.16.0.1", "172.31.255.255"})
+            require(ghost::addressDescription(ip) == "RFC 1918 内网地址", "identify private ranges");
+        require(ghost::addressDescription("172.32.0.1").find("非 RFC 1918") != std::string::npos,
+            "private range boundary");
+        require(ghost::endpoint("::1", 9987) == "[::1]:9987" &&
+            ghost::endpoint("[::1]", 9987) == "[::1]:9987", "IPv6 must be bracketed exactly once");
+        f.target.serverPassword = "secret-server-password";
+        f.target.channelPassword = "secret-channel-password";
+        const auto details = ghost::connectionDetails(f.target, 40111);
+        require(details.find("voice.example.test:19987") != std::string::npos &&
+            details.find("203.0.113.10:19987") != std::string::npos &&
+            details.find("127.0.0.1:40111") != std::string::npos, "diagnostics must show hostname, IP and relay separately");
+        require(details.find("secret-") == std::string::npos, "clipboard diagnostics must exclude both passwords");
     });
 #ifdef _WIN32
     test("GUI blocks refresh, start and restore until cancellation completes", [] {

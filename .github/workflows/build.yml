@@ -22,6 +22,15 @@ jobs:
           repository: teamspeak/ts3client-pluginsdk
           ref: 4aa90a53aa150cbf81e13bc97e68c0431b26499f
           path: .sdk
+      - name: Extract the Qt runtime shipped by official TS3 for bridge tests
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'TeamSpeak3-Client-win64-3.6.2.exe'
+          $runtime = Join-Path $env:RUNNER_TEMP 'ts3-qt-test'
+          Invoke-WebRequest 'https://files.teamspeak-services.com/releases/client/3.6.2/TeamSpeak3-Client-win64-3.6.2.exe' -OutFile $installer
+          & 7z x -y "-o$runtime" $installer Qt5Core.dll Qt5Gui.dll Qt5Widgets.dll platforms/qwindows.dll
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "TS3_QT_TEST_DIR=$runtime" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
       - run: cmake -S . -B build -A x64 -DTS3_SDK_DIR="${{ github.workspace }}/.sdk"
       - run: cmake --build build --config Release
       - name: Verify the DLL loads and its menu opens a window offline

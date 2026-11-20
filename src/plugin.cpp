@@ -2,17 +2,22 @@
 #include "plugin_api.h"
 #include "controller.h"
 #include "udp_gate.h"
+#include "endpoint.h"
+#include "gui_tabs.h"
 #include "teamspeak/public_errors.h"
 #include "teamspeak/public_rare_definitions.h"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -82,8 +87,10 @@ ghost::Target resolveTarget(const ghost::Target& observed);
     check(ts.getChannelOfClient(target.handler, id, &channelId));
     target.channelId = channelId;
     char host[4096]{}, serverPassword[4096]{}, channel[4096]{}, channelPassword[4096]{};
-    unsigned short unusedPort = 0;
-    check(ts.getServerConnectInfo(target.handler, host, &unusedPort, serverPassword, sizeof(host)));
+    unsigned short connectPort = 0;
+    check(ts.getServerConnectInfo(target.handler, host, &connectPort, serverPassword, sizeof(host)));
+    target.connectHost = *host ? host : target.address;
+    target.connectPort = connectPort ? connectPort : target.port;
     target.serverPassword = serverPassword;
     const auto channelInfoError = ts.getChannelConnectInfo(target.handler, channelId, channel, channelPassword, sizeof(channel));
     if (channelInfoError == ERROR_ok) {
@@ -103,18 +110,69 @@ ghost::Target resolveTarget(const ghost::Target& observed);
 
 class TsHost final : public ghost::Host {
 public:
+    void enableFastReconnect(bool enabled) { fastReconnect_ = enabled; }
+    void setGuiTabs(std::unique_ptr<ghost::GuiTabActions> tabs) { tabs_ = std::move(tabs); }
+    std::string reconnectDescription() const {
+        return fastReconnect_ ? tabs_->description() : "兼容重连：复用当前测试标签页";
+    }
+    void currentChanged(std::uint64_t handler) {
+        if (internalGuiCall_.load() || !trackedTabs_.load()) return;
+        std::lock_guard<std::mutex> lock(selectionMutex_);
+        userSelections_.push_back(handler);
+    }
+    void collectRetiredTabs() {
+        std::vector<std::uint64_t> selections;
+        {
+            std::lock_guard<std::mutex> lock(selectionMutex_);
+            selections.swap(userSelections_);
+        }
+        for (auto it = retiringTabs_.begin(); it != retiringTabs_.end();) {
+            if (std::find(selections.begin(), selections.end(), it->handler) != selections.end() ||
+                currentHandler() == it->handler) { it = retiringTabs_.erase(it); continue; }
+            int status = STATUS_DISCONNECTED;
+            const auto result = ts.getConnectionStatus(it->handler, &status);
+            if (result == ERROR_invalid_server_connection_handler_id || result == ERROR_not_connected) {
+                it = retiringTabs_.erase(it); continue;
+            }
+            if (result == ERROR_ok && status == STATUS_DISCONNECTED) {
+                const auto handler = it->handler;
+                internalGuiCall_.store(true);
+                const auto action = tabs_->closeInactive(it->token, [&, handler] {
+                    int now = 0;
+                    return currentHandler() != handler && ts.getConnectionStatus(handler, &now) == ERROR_ok &&
+                        now == STATUS_DISCONNECTED;
+                });
+                internalGuiCall_.store(false);
+                if (action != ghost::TabCleanup::kept) { it = retiringTabs_.erase(it); continue; }
+            }
+            ++it;
+        }
+        trackedTabs_.store(retiringTabs_.size());
+    }
     bool replacingConnection(std::uint64_t handler) const {
         return awaitingEndpoint_.load() && expectedHandler_.load() == handler;
     }
     void statusChanged(std::uint64_t handler, int status, unsigned int error) {
         if (cancelHandler_.load() == handler && status == STATUS_DISCONNECTED)
             cancelConfirmed_.store(error == ERROR_ok || error == ERROR_ok_no_update);
+        if (replacingConnection(handler)) {
+            if (status == STATUS_CONNECTING) handshakeStarted_.store(true);
+            if (status == STATUS_CONNECTION_ESTABLISHED && handshakeStarted_.load()) endpointReady_.store(true);
+        }
     }
     void reset() {
         awaitingEndpoint_.store(false);
         expectedHandler_.store(0);
         cancelHandler_.store(0);
         cancelConfirmed_.store(false);
+        handshakeStarted_.store(false);
+        endpointReady_.store(false);
+        fastReconnect_ = false;
+        internalGuiCall_.store(false);
+        retiringTabs_.clear();
+        trackedTabs_.store(0);
+        tabs_ = ghost::platformGuiTabs();
+        { std::lock_guard<std::mutex> lock(selectionMutex_); userSelections_.clear(); }
         disconnectedSince_ = {};
     }
     std::uint64_t currentHandler() override { return ts.getCurrentServerConnectionHandlerID(); }
@@ -153,6 +211,13 @@ public:
         }
         if (replacingConnection(handler)) {
             if (status != STATUS_CONNECTION_ESTABLISHED) return ghost::Connection::connecting;
+            // A saved hostname can resolve to a different address (including Fake-IP).
+            // Direct restores confirm a fresh handshake; prepare() verifies the server UID.
+            if (directRestore_) {
+                if (!endpointReady_.load()) return ghost::Connection::connecting;
+                awaitingEndpoint_.store(false);
+                return ghost::Connection::established;
+            }
             anyID ownId = 0;
             uint64 port = 0;
             if (ts.getClientID(handler, &ownId) != ERROR_ok ||
@@ -184,6 +249,8 @@ public:
         if (expectedHandler_.load() == handler) {
             awaitingEndpoint_.store(false);
             expectedHandler_.store(0);
+            handshakeStarted_.store(false);
+            endpointReady_.store(false);
         }
         if (cancelHandler_.load() == handler) {
             cancelHandler_.store(0);
@@ -193,30 +260,44 @@ public:
     }
     std::uint64_t connect(const ghost::Target& target, std::uint16_t localPort) override {
         uint64 handler = 0;
-        const auto address = "127.0.0.1:" + std::to_string(localPort);
+        const auto address = ghost::endpoint("127.0.0.1", localPort);
+        directRestore_ = false;
+        handshakeStarted_.store(false);
+        endpointReady_.store(false);
         expectedAddress_ = "127.0.0.1";
         expectedPort_ = localPort;
         expectedHandler_.store(target.handler);
         awaitingEndpoint_.store(true);
-        check(ts.guiConnect(PLUGIN_CONNECT_TAB_CURRENT, target.serverName.c_str(), address.c_str(),
+        const auto tabMode = reconnectTab(target);
+        internalGuiCall_.store(true);
+        const auto error = ts.guiConnect(tabMode, target.serverName.c_str(), address.c_str(),
             target.serverPassword.c_str(), target.nickname.c_str(), target.channelPath.c_str(),
-            target.channelPassword.c_str(), "", "", "", "", target.identityUid.c_str(), "", "", &handler));
+            target.channelPassword.c_str(), "", "", "", "", target.identityUid.c_str(), "", "", &handler);
+        internalGuiCall_.store(false);
+        check(error);
         if (!handler) throw std::runtime_error("guiConnect 未返回连接句柄");
         expectedHandler_.store(handler);
         managed.store(handler);
         return handler;
     }
     std::uint64_t connectDirect(const ghost::Target& target) override {
-        const auto address = (target.address.find(':') != std::string::npos
-            ? "[" + target.address + "]" : target.address) + ":" + std::to_string(target.port);
+        const auto address = ghost::endpoint(target.connectHost.empty() ? target.address : target.connectHost,
+            target.connectPort ? target.connectPort : target.port);
         uint64 handler = 0;
+        directRestore_ = true;
+        handshakeStarted_.store(false);
+        endpointReady_.store(false);
         expectedAddress_ = target.address;
         expectedPort_ = target.port;
         expectedHandler_.store(target.handler);
         awaitingEndpoint_.store(true);
-        check(ts.guiConnect(PLUGIN_CONNECT_TAB_CURRENT, target.serverName.c_str(), address.c_str(),
+        const auto tabMode = reconnectTab(target);
+        internalGuiCall_.store(true);
+        const auto error = ts.guiConnect(tabMode, target.serverName.c_str(), address.c_str(),
             target.serverPassword.c_str(), target.nickname.c_str(), target.channelPath.c_str(),
-            target.channelPassword.c_str(), "", "", "", "", target.identityUid.c_str(), "", "", &handler));
+            target.channelPassword.c_str(), "", "", "", "", target.identityUid.c_str(), "", "", &handler);
+        internalGuiCall_.store(false);
+        check(error);
         if (!handler) throw std::runtime_error("guiConnect 未返回连接句柄");
         expectedHandler_.store(handler);
         managed.store(handler);
@@ -252,9 +333,42 @@ public:
         return code ? errorText(code) : std::string();
     }
 private:
+    PluginConnectTab reconnectTab(const ghost::Target& target) {
+        if (!fastReconnect_) return PLUGIN_CONNECT_TAB_CURRENT;
+        int status = STATUS_DISCONNECTED;
+        if (ts.getConnectionStatus(target.handler, &status) != ERROR_ok || status == STATUS_DISCONNECTED)
+            return PLUGIN_CONNECT_TAB_CURRENT;
+        const auto token = ++nextTabToken_;
+        internalGuiCall_.store(true);
+        const bool requested = tabs_->closeCurrent(token, [&] {
+            int now = 0;
+            return currentHandler() == target.handler && ts.getConnectionStatus(target.handler, &now) == ERROR_ok &&
+                now != STATUS_DISCONNECTED;
+        });
+        internalGuiCall_.store(false);
+        if (requested) {
+            retiringTabs_.push_back({target.handler, token});
+            trackedTabs_.store(retiringTabs_.size());
+            managed.store(0); // Late errors from the retiring tab do not belong to the new session.
+            return PLUGIN_CONNECT_TAB_NEW;
+        }
+        if (currentHandler() != target.handler) throw std::runtime_error("测试标签页已变化，已取消重连");
+        return PLUGIN_CONNECT_TAB_CURRENT;
+    }
+    struct RetiringTab { std::uint64_t handler; std::uint64_t token; };
+    std::unique_ptr<ghost::GuiTabActions> tabs_ = ghost::platformGuiTabs();
+    std::vector<RetiringTab> retiringTabs_;
+    std::mutex selectionMutex_;
+    std::vector<std::uint64_t> userSelections_;
+    std::atomic_bool internalGuiCall_{false};
+    std::atomic_size_t trackedTabs_{0};
+    bool fastReconnect_ = false;
+    std::uint64_t nextTabToken_ = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
     std::atomic_bool awaitingEndpoint_{false};
     std::atomic<std::uint64_t> expectedHandler_{0}, cancelHandler_{0};
     std::atomic_bool cancelConfirmed_{false};
+    std::atomic_bool handshakeStarted_{false}, endpointReady_{false};
+    bool directRestore_ = false;
     std::chrono::steady_clock::time_point disconnectedSince_{};
     std::string expectedAddress_;
     std::uint16_t expectedPort_ = 0;
@@ -273,7 +387,7 @@ ghost::Target resolveTarget(const ghost::Target& observed) {
 constexpr wchar_t windowClass[] = L"TS3GhostUserWindowV1";
 constexpr UINT timerId = 1;
 constexpr int menuOpen = 1;
-enum { countId = 101, gapId, holdId, startId, stopId, refreshId, restoreId };
+enum { countId = 101, gapId, holdId, startId, stopId, refreshId, restoreId, copyInfoId, fastId };
 HINSTANCE module = nullptr;
 HWND window = nullptr, countBox = nullptr, gapBox = nullptr, holdBox = nullptr;
 HWND targetLabel = nullptr, statusLabel = nullptr, progress = nullptr, progressLabel = nullptr;
@@ -283,6 +397,7 @@ ghost::Target selected;
 bool hasSelection = false;
 bool busy = false;
 bool closeRequested = false;
+bool runningSelection = false;
 std::wstring notice;
 ULONGLONG lastUi = 0;
 
@@ -316,7 +431,8 @@ void updateUi() {
     if (!controller || !statusLabel) return;
     const bool running = controller->running();
     const bool idle = !running && !controller->cleaning();
-    for (const auto id : {countId, gapId, holdId, refreshId}) EnableWindow(GetDlgItem(window, id), idle);
+    for (const auto id : {countId, gapId, holdId, refreshId, fastId}) EnableWindow(GetDlgItem(window, id), idle);
+    EnableWindow(GetDlgItem(window, copyInfoId), hasSelection);
     EnableWindow(GetDlgItem(window, startId), idle);
     EnableWindow(GetDlgItem(window, stopId), running);
     EnableWindow(GetDlgItem(window, restoreId), idle && hasSelection);
@@ -331,11 +447,31 @@ void selectCurrent() {
     if (controller->running() || controller->cleaning()) return;
     selected = readTarget();
     hasSelection = true;
+    runningSelection = false;
     notice.clear();
-    setText(targetLabel, wide(selected.serverName + "   ·   " + selected.address + ":" + std::to_string(selected.port)
+    setText(targetLabel, wide(selected.serverName + "   ·   " + ghost::endpoint(selected.connectHost, selected.connectPort)
+        + "\r\n传输 IP：" + ghost::endpoint(selected.address, selected.port) + "  （" + ghost::addressDescription(selected.address) + "）"
         + "\r\n昵称：" + selected.nickname + "    频道：" +
         (selected.channelPath.empty() ? "ID " + std::to_string(selected.channelId) : selected.channelPath)
         + "\r\n身份 UID：" + selected.identityUid));
+    updateUi();
+}
+void copyConnectionInfo() {
+    if (!hasSelection) throw std::runtime_error("请先读取当前连接");
+    const auto text = wide(ghost::connectionDetails(selected, controller->localPort()) +
+        "重连方式：" + host.reconnectDescription() + "\r\n");
+    const auto bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!memory) throw std::runtime_error("无法分配剪贴板内存");
+    void* buffer = GlobalLock(memory);
+    if (!buffer) { GlobalFree(memory); throw std::runtime_error("无法写入剪贴板内存"); }
+    std::memcpy(buffer, text.c_str(), bytes);
+    GlobalUnlock(memory);
+    if (!OpenClipboard(window)) { GlobalFree(memory); throw std::runtime_error("暂时无法打开剪贴板，请重试"); }
+    const bool copied = EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, memory);
+    CloseClipboard();
+    if (!copied) { GlobalFree(memory); throw std::runtime_error("复制连接信息失败"); }
+    if (!controller->running() && !controller->cleaning()) notice = L"连接信息已复制（不包含连接密码）";
     updateUi();
 }
 void start() {
@@ -356,7 +492,9 @@ void start() {
     notice.clear();
     managed.store(selected.handler);
     pendingError.store(0);
+    host.enableFastReconnect(SendMessageW(GetDlgItem(window, fastId), BM_GETCHECK, 0, 0) == BST_CHECKED);
     controller->start(selected, options, GetTickCount64());
+    runningSelection = true;
     updateUi();
 }
 void restore() {
@@ -371,6 +509,7 @@ void restore() {
     notice.clear();
     controller->restore(target, GetTickCount64());
     selected.handler = controller->handler();
+    runningSelection = true;
     updateUi();
 }
 
@@ -387,7 +526,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             auto title = control(L"STATIC", L"Ghost User", 0, 28, 22, 480, 40);
             SendMessageW(title, WM_SETFONT, reinterpret_cast<WPARAM>(titleFont), TRUE);
             control(L"STATIC", L"TeamSpeak 3  /  连接超时测试", 0, 30, 66, 600, 24);
-            control(L"STATIC", L"当前测试连接", 0, 30, 110, 420, 24);
+            control(L"STATIC", L"当前测试连接", 0, 30, 110, 300, 24);
+            control(L"BUTTON", L"复制连接信息", BS_PUSHBUTTON | WS_TABSTOP, 360, 105, 148, 32, copyInfoId);
             control(L"BUTTON", L"读取当前连接", BS_PUSHBUTTON | WS_TABSTOP, 520, 105, 148, 32, refreshId);
             targetLabel = control(L"STATIC", L"连接测试服务器后，点击“读取当前连接”。", 0, 30, 144, 638, 88);
             control(L"STATIC", L"批次次数", 0, 30, 252, 190, 24);
@@ -409,8 +549,10 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             SendMessageW(progress, PBM_SETRANGE32, 0, 1000);
             progressLabel = control(L"STATIC", L"", 0, 30, 486, 638, 24);
             statusLabel = control(L"STATIC", L"就绪", 0, 30, 524, 638, 68);
-            control(L"STATIC", L"使用当前身份和频道；切换 TS3 标签页或关闭窗口会停止批次。",
-                0, 30, 606, 638, 44);
+            const auto fast = control(L"BUTTON", L"快速重连（更换测试标签页，旧连接后台清理）",
+                BS_AUTOCHECKBOX | WS_TABSTOP, 30, 606, 638, 24, fastId);
+            SendMessageW(fast, BM_SETCHECK, BST_CHECKED, 0);
+            control(L"STATIC", L"仅操作测试标签页；切换标签页或关闭窗口会停止批次。", 0, 30, 635, 638, 24);
             if (!SetTimer(hwnd, timerId, 20, nullptr)) throw std::runtime_error("无法启动 GUI 定时器");
             updateUi();
             return 0;
@@ -424,7 +566,10 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                     controller->stop("已停止：控制窗口已关闭");
                     ShowWindow(hwnd, SW_HIDE);
                 }
+                host.collectRetiredTabs();
                 controller->tick(now);
+                if (runningSelection && controller->handler()) selected.handler = controller->handler();
+                if (!controller->running() && !controller->cleaning()) runningSelection = false;
                 if (now - lastUi >= 200 && IsWindowVisible(hwnd)) { updateUi(); lastUi = now; }
                 busy = false;
             }
@@ -438,6 +583,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                     case startId: start(); break;
                     case stopId: notice.clear(); controller->stop(); updateUi(); break;
                     case restoreId: restore(); break;
+                    case copyInfoId: copyConnectionInfo(); break;
                     default: break;
                     }
                 } catch (...) { busy = false; throw; }
@@ -570,6 +716,7 @@ void ts3plugin_shutdown() {
     if (window) DestroyWindow(window);
     if (module) UnregisterClassW(windowClass, module);
     hasSelection = false;
+    runningSelection = false;
     closeRequested = false;
     notice.clear();
     selected = {};
@@ -610,6 +757,7 @@ void ts3plugin_onConnectStatusChangeEvent(uint64 handler, int status, unsigned i
     if (handler == managed.load() && status == STATUS_DISCONNECTED && error != ERROR_ok && error != ERROR_ok_no_update)
         pendingError.store(error);
 }
+void ts3plugin_currentServerConnectionChanged(uint64 handler) { host.currentChanged(handler); }
 int ts3plugin_onServerErrorEvent(uint64 handler, const char*, unsigned int error, const char*, const char*) {
     if (handler == managed.load() && error != ERROR_ok && error != ERROR_ok_no_update) pendingError.store(error);
     return 0; // Preserve TeamSpeak's own error display.
