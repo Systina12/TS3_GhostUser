@@ -212,9 +212,10 @@ int main() {
     });
 #ifdef _WIN32
     test("GUI blocks refresh, start and restore until cancellation completes", [] {
-        Fixture f; f.relay();
+        Fixture f;
         module = GetModuleHandleW(nullptr);
         showWindow();
+        f.relay();
         controller->tick(4); f.data.finishStop = false; controller->stop(); updateUi();
         for (const auto id : {refreshId, startId, restoreId})
             require(!IsWindowEnabled(GetDlgItem(window, id)), "cleanup must disable connection-changing controls");
