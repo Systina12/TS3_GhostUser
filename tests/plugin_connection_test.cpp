@@ -29,11 +29,13 @@ struct State {
     std::map<uint64, Tab> tabs{{1, {}}, {2, {}}};
     bool finishStop = true, moveImmediately = true, failChannelInfo = false;
     bool allowNewTabs = false;
+    unsigned int guiError = ERROR_ok;
     PluginConnectTab lastTabMode = PLUGIN_CONNECT_TAB_CURRENT;
     int stops = 0, cuts = 0, closed = 0, moves = 0;
     std::string connectAddress, connectPath, movePassword;
     uint64 moveChannel = 0;
     std::string serverUid = "server uid";
+    std::function<void(uint64)> duringConnect;
     void event(uint64 handler, int status, unsigned int code = ERROR_ok) {
         tabs.at(handler).status = status;
         ts3plugin_onConnectStatusChangeEvent(handler, status, code);
@@ -57,17 +59,21 @@ struct TestTabs final : ghost::GuiTabActions {
     State& data;
     bool supported = true;
     int closed = 0;
+    std::function<void()> duringClose;
+    std::function<void()> duringCleanup;
     std::map<std::uint64_t, std::uint64_t> tokens;
     explicit TestTabs(State& s) : data(s) {}
     bool closeCurrent(std::uint64_t token, const Guard& guard) override {
         if (!supported || !guard()) return false;
         tokens[token] = data.current;
+        if (duringClose) duringClose();
         return true; // Model the GUI's asynchronous close; the old handler stays alive.
     }
     ghost::TabCleanup closeInactive(std::uint64_t token, const Guard& guard) override {
         const auto found = tokens.find(token);
         if (found == tokens.end()) return ghost::TabCleanup::missing;
         if (!guard()) return ghost::TabCleanup::kept;
+        if (duringCleanup) duringCleanup();
         data.tabs.at(found->second).valid = false;
         tokens.erase(found); ++closed;
         return ghost::TabCleanup::closed;
@@ -104,8 +110,9 @@ TS3Functions functions() {
         state->connectAddress = address;
         state->connectPath = channel;
         *result = state->current;
+        if (state->duringConnect) state->duringConnect(*result);
         // Deliberately leave status and endpoint stale, as guiConnect does in TS3.
-        return ERROR_ok;
+        return state->guiError;
     };
     f.getClientID = [](uint64, anyID* out) -> unsigned int { *out = 7; return ERROR_ok; };
     f.getConnectionVariableAsUInt64 = [](uint64 handler, anyID, size_t, uint64* out) -> unsigned int {
@@ -212,6 +219,98 @@ int main() {
         controller->tick(10); controller->tick(11);
         require(!controller->running() && f.data.cuts == 2 && f.data.tabs.at(2).valid &&
             f.data.tabs.at(2).status == STATUS_CONNECTION_ESTABLISHED, "exact batch and unrelated tab preservation");
+    });
+    test("fast restore preserves callbacks delivered before guiConnect returns", [] {
+        for (bool establishInsideCall : {false, true}) {
+            Fixture f; f.relay();
+            host.setGuiTabs(std::make_unique<TestTabs>(f.data));
+            host.enableFastReconnect(true); f.data.allowNewTabs = true;
+            f.data.duringConnect = [&](uint64 handler) {
+                f.data.event(handler, STATUS_CONNECTING);
+                if (establishInsideCall) f.data.event(handler, STATUS_CONNECTION_ESTABLISHED);
+            };
+            controller->tick(4); controller->tick(5);
+            const auto second = controller->handler();
+            f.data.tabs.at(second).address = "127.0.0.1"; f.data.tabs.at(second).port = 40111;
+            if (!establishInsideCall) f.data.event(second, STATUS_CONNECTION_ESTABLISHED);
+            controller->tick(6); controller->tick(7); controller->tick(8); controller->tick(9);
+            const auto restored = controller->handler();
+            if (!establishInsideCall) f.data.event(restored, STATUS_CONNECTION_ESTABLISHED);
+            controller->tick(10); controller->tick(11);
+            require(restored == 4 && !controller->running() && f.data.cuts == 2 &&
+                f.data.tabs.at(restored).status == STATUS_CONNECTION_ESTABLISHED,
+                "early callbacks must complete the real restore without a false timeout");
+        }
+    });
+    test("early errors from the new tab are retained and old-tab errors are ignored", [] {
+        for (bool serverError : {false, true}) {
+            Fixture f; f.relay();
+            host.setGuiTabs(std::make_unique<TestTabs>(f.data));
+            host.enableFastReconnect(true); f.data.allowNewTabs = true;
+            f.data.duringConnect = [&](uint64 handler) {
+                f.data.event(1, STATUS_DISCONNECTED, ERROR_connection_lost);
+                ts3plugin_onServerErrorEvent(1, "old tab", ERROR_server_maxclients_reached, "", "");
+                if (serverError)
+                    ts3plugin_onServerErrorEvent(handler, "rejected", ERROR_server_maxclients_reached, "", "");
+                else f.data.event(handler, STATUS_DISCONNECTED, ERROR_server_maxclients_reached);
+            };
+            controller->tick(4); controller->tick(5);
+            require(!host.takeError().empty(), "new-tab errors must survive the synchronous GUI call");
+        }
+        Fixture f; f.relay();
+        host.setGuiTabs(std::make_unique<TestTabs>(f.data));
+        host.enableFastReconnect(true); f.data.allowNewTabs = true;
+        f.data.duringConnect = [&](uint64) {
+            f.data.event(1, STATUS_DISCONNECTED, ERROR_connection_lost);
+            ts3plugin_onServerErrorEvent(1, "old tab", ERROR_server_maxclients_reached, "", "");
+        };
+        controller->tick(4); controller->tick(5);
+        require(host.takeError().empty(), "old-tab errors must not be replayed into the new session");
+    });
+    test("failed guiConnect discards its buffered callbacks before the next attempt", [] {
+        Fixture f;
+        f.data.guiError = ERROR_server_invalid_password;
+        f.data.duringConnect = [&](uint64 handler) {
+            f.data.event(handler, STATUS_CONNECTING);
+            ts3plugin_onServerErrorEvent(handler, "rejected", ERROR_server_maxclients_reached, "", "");
+        };
+        bool rejected = false;
+        try { host.connectDirect(f.target); }
+        catch (const std::runtime_error&) { rejected = true; }
+        require(rejected && host.takeError().empty(), "a failed call must discard its provisional events");
+        f.data.guiError = ERROR_ok; f.data.duringConnect = {};
+        const auto handler = host.connectDirect(f.target);
+        f.data.event(handler, STATUS_CONNECTION_ESTABLISHED);
+        require(host.connection(handler) == ghost::Connection::connecting,
+            "a previous attempt's handshake cannot confirm this attempt");
+        f.data.event(handler, STATUS_CONNECTING); f.data.event(handler, STATUS_CONNECTION_ESTABLISHED);
+        require(host.connection(handler) == ghost::Connection::established, "later callbacks must no longer be buffered");
+    });
+    test("a retiring tab's handshake during close cannot confirm its replacement", [] {
+        Fixture f;
+        auto tabs = std::make_unique<TestTabs>(f.data);
+        tabs->duringClose = [&] {
+            f.data.event(1, STATUS_CONNECTING); f.data.event(1, STATUS_CONNECTION_ESTABLISHED);
+        };
+        host.setGuiTabs(std::move(tabs)); host.enableFastReconnect(true); f.data.allowNewTabs = true;
+        const auto handler = host.connectDirect(f.target);
+        f.data.event(handler, STATUS_CONNECTION_ESTABLISHED);
+        require(host.connection(handler) == ghost::Connection::connecting,
+            "an old-tab handshake before guiConnect must not arm the new handler");
+        f.data.event(handler, STATUS_CONNECTING); f.data.event(handler, STATUS_CONNECTION_ESTABLISHED);
+        require(host.connection(handler) == ghost::Connection::established, "the replacement's own handshake must confirm it");
+    });
+    test("another tab cannot supply the fresh-handshake confirmation", [] {
+        Fixture f;
+        host.setGuiTabs(std::make_unique<TestTabs>(f.data));
+        host.enableFastReconnect(true); f.data.allowNewTabs = true;
+        f.data.duringConnect = [&](uint64) { f.data.event(2, STATUS_CONNECTING); };
+        const auto handler = host.connectDirect(f.target);
+        f.data.event(handler, STATUS_CONNECTION_ESTABLISHED);
+        require(host.connection(handler) == ghost::Connection::connecting,
+            "unrelated early callbacks must not confirm the new direct connection");
+        f.data.event(handler, STATUS_CONNECTING); f.data.event(handler, STATUS_CONNECTION_ESTABLISHED);
+        require(host.connection(handler) == ghost::Connection::established, "its own handshake must still complete");
     });
     test("user selection relinquishes ownership of a retiring tab", [] {
         Fixture f; f.relay();
@@ -341,6 +440,47 @@ int main() {
         require(details.find("secret-") == std::string::npos, "clipboard diagnostics must exclude both passwords");
     });
 #ifdef _WIN32
+    test("Stop delivered inside guiConnect cancels the returned replacement handler", [] {
+        Fixture f; f.relay();
+        host.setGuiTabs(std::make_unique<TestTabs>(f.data));
+        host.enableFastReconnect(true); f.data.allowNewTabs = true;
+        module = GetModuleHandleW(nullptr); showWindow();
+        controller->tick(4); // First intentional cut; the next timer starts a replacement.
+        f.data.duringConnect = [&](uint64) {
+            require(busy, "exercise the actual nested Windows message path");
+            SendMessageW(window, WM_COMMAND, MAKEWPARAM(stopId, BN_CLICKED), 0);
+            require(controller->running(), "Stop must defer until guiConnect has returned its handler");
+        };
+        SendMessageW(window, WM_TIMER, timerId, 0);
+        const auto replacement = controller->handler();
+        require(replacement == 3 && !controller->running() && f.data.cuts == 1 &&
+            f.data.tabs.at(replacement).status == STATUS_DISCONNECTED,
+            "the deferred Stop must cancel the new handler without another cut");
+        require(f.data.tabs.at(2).status == STATUS_CONNECTION_ESTABLISHED, "another server tab must be preserved");
+        f.data.event(1, STATUS_DISCONNECTED); host.collectRetiredTabs();
+        ts3plugin_shutdown();
+        require(!stopRequested, "unload must clear deferred controls");
+    });
+    test("Stop delivered during retired-tab cleanup is handled before the next cut", [] {
+        Fixture f; f.relay();
+        auto tabs = std::make_unique<TestTabs>(f.data); auto* actions = tabs.get();
+        host.setGuiTabs(std::move(tabs)); host.enableFastReconnect(true); f.data.allowNewTabs = true;
+        controller->tick(4); controller->tick(5);
+        const auto replacement = controller->handler();
+        f.data.tabs.at(replacement).address = "127.0.0.1"; f.data.tabs.at(replacement).port = 40111;
+        f.data.event(replacement, STATUS_CONNECTING); f.data.event(replacement, STATUS_CONNECTION_ESTABLISHED);
+        controller->tick(6); controller->tick(7);
+        f.data.event(1, STATUS_DISCONNECTED);
+        module = GetModuleHandleW(nullptr); showWindow();
+        actions->duringCleanup = [&] {
+            SendMessageW(window, WM_COMMAND, MAKEWPARAM(stopId, BN_CLICKED), 0);
+        };
+        SendMessageW(window, WM_TIMER, timerId, 0);
+        require(!controller->running() && f.data.cuts == 1 && !f.data.tabs.at(1).valid &&
+            f.data.tabs.at(replacement).status == STATUS_DISCONNECTED,
+            "background cleanup must honor Stop before a holding session can be cut");
+        ts3plugin_shutdown();
+    });
     test("GUI tracks replacement handlers and can start another fast batch", [] {
         Fixture f;
         auto tabs = std::make_unique<TestTabs>(f.data);
