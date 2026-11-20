@@ -168,6 +168,10 @@ void CALLBACK confirmClose(HWND, UINT, UINT_PTR, DWORD) {
         return FALSE;
     }, reinterpret_cast<LPARAM>(attempt));
 }
+LRESULT CALLBACK confirmationWindow(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_TIMER) { confirmClose(window, message, wParam, GetTickCount()); return 0; }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
 
 class QtGuiTabs final : public GuiTabActions {
 public:
@@ -214,12 +218,33 @@ private:
         for (const auto* context : {"MainWindow", "AreYouSureDialog", "ServerHandler", "ServerTabWidget", "ImprovedTabBar", "QObject"})
             for (const auto* title : {"Disconnect from Server", "Close Connected Server Tab"})
                 attempt.titles.push_back(api_.translated(context, title));
-        const auto timer = SetTimer(nullptr, 0, 10, confirmClose);
-        if (!timer) { reason_ = "无法启动标签页关闭确认，使用兼容重连"; return false; }
+        HMODULE module = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&confirmationWindow), &module)) return false;
+        constexpr wchar_t className[] = L"TS3GhostConfirmBridgeV014";
+        WNDCLASSW klass{};
+        klass.hInstance = module; klass.lpfnWndProc = confirmationWindow; klass.lpszClassName = className;
+        if (!RegisterClassW(&klass)) return false;
+        const auto window = CreateWindowExW(0, className, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, module, nullptr);
+        if (!window || !SetTimer(window, 1, 10, nullptr)) {
+            if (window) DestroyWindow(window);
+            UnregisterClassW(className, module);
+            reason_ = "无法启动标签页关闭确认，使用兼容重连";
+            return false;
+        }
         activeConfirmation = &attempt;
-        const bool invoked = action();
+        bool invoked = false;
+        try { invoked = action(); }
+        catch (...) {
+            activeConfirmation = nullptr;
+            DestroyWindow(window); UnregisterClassW(className, module);
+            throw;
+        }
         activeConfirmation = nullptr;
-        KillTimer(nullptr, timer);
+        // A message-only window prevents queued thread-timer callbacks from retaining
+        // a function pointer into this DLL after plugin unload.
+        DestroyWindow(window);
+        UnregisterClassW(className, module);
         if (attempt.cancelled) reason_ = "关闭确认未匹配或测试标签页已变化，使用兼容重连";
         return invoked && !attempt.cancelled;
     }

@@ -19,7 +19,7 @@ exports=$(awk '
 ' <<< "$table")
 
 for callback in name version apiVersion author description setFunctionPointers init shutdown \
-    registerPluginID initMenus freeMemory onMenuItemEvent; do
+    registerPluginID initMenus freeMemory onMenuItemEvent currentServerConnectionChanged; do
   symbol="ts3plugin_$callback"
   if ! awk -v symbol="$symbol" '$0 == symbol { found = 1 } END { exit !found }' <<< "$exports"; then
     printf 'Missing DLL export: %s\n' "$symbol" >&2

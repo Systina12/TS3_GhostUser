@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 namespace {
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
@@ -15,6 +16,11 @@ template<class Fn> Fn symbol(HMODULE module, const char* name) {
     return reinterpret_cast<Fn>(value);
 }
 struct alignas(16) Storage { unsigned char bytes[4096]{}; };
+ghost::QtApi* logApi = nullptr;
+void qtLog(int type, const void*, const ghost::QtString* text) {
+    if (logApi) std::wcerr.write(logApi->stringUtf16(text), logApi->stringSize(text)) << std::endl;
+    if (type == 3) ExitProcess(1);
+}
 }
 
 int main(int argc, char** argv) {
@@ -23,12 +29,32 @@ int main(int argc, char** argv) {
         const std::filesystem::path directory(argv[1]);
         SetDllDirectoryW(directory.c_str());
         SetEnvironmentVariableW(L"QT_QPA_PLATFORM_PLUGIN_PATH", (directory / L"platforms").c_str());
+        SetEnvironmentVariableW(L"QT_DEBUG_PLUGINS", L"1");
+        SetEnvironmentVariableW(L"QT_OPENGL", L"software");
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
         require(LoadLibraryW((directory / L"Qt5Core.dll").c_str()) != nullptr, "Load Qt5Core");
         require(LoadLibraryW((directory / L"Qt5Gui.dll").c_str()) != nullptr, "Load Qt5Gui");
         require(LoadLibraryW((directory / L"Qt5Widgets.dll").c_str()) != nullptr, "Load Qt5Widgets");
         const auto core = GetModuleHandleW(L"Qt5Core.dll"), widgets = GetModuleHandleW(L"Qt5Widgets.dll");
         ghost::QtApi api;
         require(api.load(), "All production bridge symbols must resolve");
+        logApi = &api;
+        using MessageHandler = void (*)(int, const void*, const ghost::QtString*);
+        const auto installLog = symbol<MessageHandler (*)(MessageHandler)>(core,
+            "?qInstallMessageHandler@@YAP6AXW4QtMsgType@@AEBVQMessageLogContext@@AEBVQString@@@ZP6AX012@Z@Z");
+        const auto previousLog = installLog(qtLog);
+        std::thread([] {
+            Sleep(10000);
+            EnumWindows([](HWND window, LPARAM) -> BOOL {
+                DWORD pid = 0; GetWindowThreadProcessId(window, &pid);
+                if (pid == GetCurrentProcessId()) {
+                    wchar_t title[512]{}, kind[256]{};
+                    GetWindowTextW(window, title, 512); GetClassNameW(window, kind, 256);
+                    std::wcerr << L"WATCHDOG window: " << title << L" class: " << kind << std::endl;
+                }
+                return TRUE;
+            }, 0);
+        }).detach();
         std::cout << "Qt runtime " << api.version() << std::endl;
         const auto applicationConstruct = symbol<void (*)(void*, int*, char**, int)>(widgets, "??0QApplication@@QEAA@AEAHPEAPEADH@Z");
         const auto applicationDestroy = symbol<void (*)(void*)>(widgets, "??1QApplication@@UEAA@XZ");
@@ -48,7 +74,9 @@ int main(int argc, char** argv) {
         std::sscanf(api.version(), "%u.%u.%u", &major, &minor, &patch);
         Storage application, root, bar;
         int appArgc = 1; char appName[] = "qt_tabs_runtime_test"; char* appArgv[]{appName, nullptr};
+        std::cout << "Construct QApplication" << std::endl;
         applicationConstruct(&application, &appArgc, appArgv, static_cast<int>((major << 16) | (minor << 8) | patch));
+        std::cout << "Construct test widgets" << std::endl;
         widgetConstruct(&root, nullptr, 0);
         barConstruct(&bar, &root);
         closable(&bar, true);
@@ -63,11 +91,13 @@ int main(int argc, char** argv) {
         connect(&connection, first, "2clicked(bool)", &root, "1hide()", 1);
         connectionDestroy(&connection);
         show(&bar); show(&root);
+        std::cout << "Test GUI actions" << std::endl;
         auto actions = ghost::platformGuiTabs();
         constexpr std::uint64_t token = 0x1234567812345678ULL;
         require(!actions->closeCurrent(token, [] { return false; }), "reject a failed ownership guard");
         require(api.visible(&root), "failed ownership guard must not activate the close button");
         require(actions->closeCurrent(token, [] { return true; }), "invoke owned Qt close button");
+        std::cout << "Test inactive cleanup" << std::endl;
         require(!api.visible(&root), "close button signal must reach its receiver");
         require(api.token(first) == token, "QVariant token must round-trip exactly");
         show(&root);
@@ -85,7 +115,9 @@ int main(int argc, char** argv) {
         require(actions->closeInactive(token + 1, [] { return true; }) == ghost::TabCleanup::missing,
             "unrelated tabs must not match another token");
         api.stringDestroy(&name); api.stringDestroy(&text);
+        std::cout << "Destroy test widgets" << std::endl;
         barDestroy(&bar); widgetDestroy(&root); applicationDestroy(&application);
+        installLog(previousLog); logApi = nullptr;
         std::cout << "PASS vendor Qt bridge, ownership guards, token lifetime and typed queued/direct calls\n";
         return 0;
     } catch (const std::exception& error) {
