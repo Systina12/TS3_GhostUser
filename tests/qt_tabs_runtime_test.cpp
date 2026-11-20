@@ -134,6 +134,10 @@ int main(int argc, char** argv) {
         connect(&connection, second, "2clicked(bool)", &dialog, "1exec()", 1);
         connectionDestroy(&connection);
         show(&root);
+        const auto controllerWindow = CreateWindowExW(WS_EX_APPWINDOW, L"STATIC", L"Native controller test",
+            WS_OVERLAPPEDWINDOW, 20, 20, 240, 120, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        require(controllerWindow != nullptr, "create a native foreground controller");
+        ShowWindow(controllerWindow, SW_SHOWNORMAL); SetForegroundWindow(controllerWindow);
         require(actions->closeCurrent(token + 2, [] { return true; }), "recognize the owned close dialog");
         require(dialogResult(&dialog) == 0x4000, "the close dialog must receive Yes");
         api.stringConstruct(&title, L"Unrecognized confirmation", 25);
@@ -141,6 +145,7 @@ int main(int argc, char** argv) {
         show(&root);
         require(!actions->closeCurrent(token + 3, [] { return true; }), "decline an unrecognized confirmation");
         require(dialogResult(&dialog) == 0x10000, "an unrecognized confirmation must receive No");
+        DestroyWindow(controllerWindow);
         messageDestroy(&dialog);
         api.stringDestroy(&name); api.stringDestroy(&text);
         std::cout << "Destroy test widgets" << std::endl;
