@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(TS3GhostUser VERSION 0.1.4 LANGUAGES CXX)
+project(TS3GhostUser VERSION 0.1.5 LANGUAGES CXX)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(TS3_SDK_DIR "" CACHE PATH "Official ts3client-pluginsdk checkout")
 if(NOT EXISTS "${TS3_SDK_DIR}/include/ts3_functions.h")

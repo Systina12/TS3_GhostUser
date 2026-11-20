@@ -8,7 +8,7 @@ Windows x64 的 TeamSpeak 3 原生 GUI 插件，用于在自有服务器上重�
 
 修复 0.1.0 遗漏 `ts3plugin_registerPluginID` 导致顶部 Plugins 菜单缺少入口的问题。官方 SDK 要求使用菜单时同时实现这个注册回调与 `ts3plugin_freeMemory`。回归检查现在覆盖注册 ID、复制临时 ID 缓冲区、创建菜单及卸载后清理的顺序。
 
-升级时完全退出 TS3，使用最新 DLL 替换旧版，再启动。在插件管理器中确认 Ghost User 已启用且版本为 0.1.4，然后打开顶部 Plugins 菜单。
+升级时完全退出 TS3，使用最新 DLL 替换旧版，再启动。在插件管理器中确认 Ghost User 已启用且版本为 0.1.5，然后打开顶部 Plugins 菜单。
 
 ## 0.1.2 时间参数
 
@@ -36,13 +36,19 @@ Windows x64 的 TeamSpeak 3 原生 GUI 插件，用于在自有服务器上重�
 
 `127.0.0.1` 是插件本地转发。`192.18.0.1` 不在 RFC 1918 内网地址段；`198.18.0.0/15` 是基准测试地址段，也常被代理用于 Fake-IP 映射。代码不会预设这两种目标地址；传输 IP 来自 TS3 当前连接。地址段只能帮助分类，具体来源需要结合实际连接信息与代理配置判断。参考：[IANA 地址分类](https://www.iana.org/assignments/iana-ipv4-special-registry)、[Mihomo Fake-IP 配置](https://wiki.metacubex.one/config/dns/)。
 
+## 0.1.5 回调、停止与多语言修复
+
+保留 `guiConnect` 返回前到达的状态和服务器错误，取得新连接句柄后按顺序处理该句柄的回调，避免新标签页已经连接成功却被误报为恢复超时。旧标签页与其他标签页的回调不会用于确认新连接，失败调用的暂存事件会清除。
+
+GUI 忙碌期间收到“停止”会保存请求，在当前调用返回后执行；后台标签页清理返回后也会先处理停止，再推进批次，避免额外执行一次断网。关闭确认补上 TS3 使用的 `ServerViewManager` 翻译上下文，回归测试使用官方德语、日语、俄语翻译文件核对两种关闭对话框。
+
 ## 验证状态
 
 已使用官方 Linux TS3 3.6.2 客户端和 3.13.8 服务端进行真实连接测试，插件采用普通 Guest 身份。临时服务器将 Guest 的同身份并发许可设为 3，观察程序从服务端确认两次残留会话以及最后恢复的正常连接。两次断联后，旧会话分别约 28.7 秒后超时消失。默认 Guest 不允许同身份并发的拒绝情形也已观察到，客户端会提示同身份连接数超限。
 
 0.1.3 另已在该本地服务器验证停止后取消旧端点重试、转发正常时卸载、断网后卸载，以及两次断网后恢复直连。连接测试和观察均使用普通身份；没有为插件使用管理员权限。
 
-控制器、UDP 数据报和离线插件加载测试可在 Linux 运行。当前回归覆盖 16 项控制器用例、13 项 SDK 连接用例、UDP 转发与离线菜单加载。Windows CTest 另使用模拟宿主检查 DLL 的初始化、菜单、窗口生命周期和清理期间的按钮状态。Windows DLL 已交叉编译，另使用官方 Windows 安装包自带的 Qt DLL 运行界面桥接测试；完整 Windows TS3 客户端的运行效果仍待实机验证。
+控制器、UDP 数据报和离线插件加载测试可在 Linux 运行。当前回归覆盖 16 项控制器用例、18 项 SDK 连接用例、UDP 转发与离线菜单加载。Windows CTest 另有 4 项 GUI 用例，覆盖窗口生命周期、按钮状态，以及重连和后台清理期间收到停止请求的处理。Windows 桥接测试使用官方 Windows 安装包自带的 Qt DLL 和翻译文件；完整 Windows TS3 客户端的运行效果仍待实机验证。
 
 ## 安装和操作
 
@@ -92,7 +98,7 @@ Linux 使用 Zig 0.13.0 交叉编译。打包前通过 binutils 的 `objdump` �
 ZIG=/path/to/zig TS3_SDK_DIR=/tmp/ts3-sdk bash tools/build_windows.sh
 ```
 
-产物为 `dist/ghostuser.dll`、带版本号的 ZIP（例如 `dist/GhostUser-v0.1.4-windows-x64.zip`）和 `dist/GhostUser-windows-x64.zip`。
+产物为 `dist/ghostuser.dll`、带版本号的 ZIP（例如 `dist/GhostUser-v0.1.5-windows-x64.zip`）和 `dist/GhostUser-windows-x64.zip`。
 
 Linux 本地验证：
 

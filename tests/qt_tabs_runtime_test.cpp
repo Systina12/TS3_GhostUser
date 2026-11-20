@@ -145,6 +145,38 @@ int main(int argc, char** argv) {
         show(&root);
         require(!actions->closeCurrent(token + 3, [] { return true; }), "decline an unrecognized confirmation");
         require(dialogResult(&dialog) == 0x10000, "an unrecognized confirmation must receive No");
+        std::cout << "Test official localized close confirmations" << std::endl;
+        const auto translatorConstruct = symbol<void (*)(void*, void*)>(core, "??0QTranslator@@QEAA@PEAVQObject@@@Z");
+        const auto translatorDestroy = symbol<void (*)(void*)>(core, "??1QTranslator@@UEAA@XZ");
+        const auto translatorLoad = symbol<bool (*)(void*, const ghost::QtString*, const ghost::QtString*,
+            const ghost::QtString*, const ghost::QtString*)>(core, "?load@QTranslator@@QEAA_NAEBVQString@@000@Z");
+        const auto installTranslator = symbol<bool (*)(void*)>(core, "?installTranslator@QCoreApplication@@SA_NPEAVQTranslator@@@Z");
+        const auto removeTranslator = symbol<bool (*)(void*)>(core, "?removeTranslator@QCoreApplication@@SA_NPEAVQTranslator@@@Z");
+        ghost::QtString empty;
+        api.stringConstruct(&empty, L"", 0);
+        for (const auto* language : {L"lagos_de.qm", L"lagos_ja.qm", L"lagos_ru.qm"}) {
+            Storage translator;
+            translatorConstruct(&translator, nullptr);
+            const auto path = (directory / L"translations" / language).wstring();
+            ghost::QtString filename;
+            api.stringConstruct(&filename, path.c_str(), static_cast<int>(path.size()));
+            require(translatorLoad(&translator, &filename, &empty, &empty, &empty), "load an official TS3 translation");
+            api.stringDestroy(&filename);
+            require(installTranslator(&translator), "install the official translator");
+            for (const auto* source : {"Disconnect from Server", "Close Connected Server Tab"}) {
+                const auto translated = api.translated("ServerViewManager", source);
+                require(translated != L"Disconnect from Server" && translated != L"Close Connected Server Tab",
+                    "the fixture must exercise a translated title, not an English fallback");
+                api.stringConstruct(&title, translated.c_str(), static_cast<int>(translated.size()));
+                setTitle(&dialog, &title); api.stringDestroy(&title);
+                show(&root);
+                require(actions->closeCurrent(token + 4, [] { return true; }), "recognize a localized TS3 close dialog");
+                require(dialogResult(&dialog) == 0x4000, "the localized dialog must receive Yes");
+            }
+            require(removeTranslator(&translator), "remove the translator before destruction");
+            translatorDestroy(&translator);
+        }
+        api.stringDestroy(&empty);
         DestroyWindow(controllerWindow);
         messageDestroy(&dialog);
         api.stringDestroy(&name); api.stringDestroy(&text);

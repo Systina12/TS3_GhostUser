@@ -216,7 +216,7 @@ private:
     bool close(HWND owner, const Guard& guard, const std::function<bool()>& action) {
         if (activeConfirmation || !guard()) return false;
         Confirmation attempt{api_, guard, owner, {L"Disconnect from Server", L"Close Connected Server Tab"}};
-        for (const auto* context : {"MainWindow", "AreYouSureDialog", "ServerHandler", "ServerTabWidget", "ImprovedTabBar", "QObject"})
+        for (const auto* context : {"ServerViewManager", "MainWindow", "AreYouSureDialog", "ServerHandler", "ServerTabWidget", "ImprovedTabBar", "QObject"})
             for (const auto* title : {"Disconnect from Server", "Close Connected Server Tab"})
                 attempt.titles.push_back(api_.translated(context, title));
         HMODULE module = nullptr;

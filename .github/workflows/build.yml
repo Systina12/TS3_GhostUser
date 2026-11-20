@@ -28,7 +28,7 @@ jobs:
           $installer = Join-Path $env:RUNNER_TEMP 'TeamSpeak3-Client-win64-3.6.2.exe'
           $runtime = Join-Path $env:RUNNER_TEMP 'ts3-qt-test'
           Invoke-WebRequest 'https://files.teamspeak-services.com/releases/client/3.6.2/TeamSpeak3-Client-win64-3.6.2.exe' -OutFile $installer
-          & 7z x -y "-o$runtime" $installer Qt5Core.dll Qt5Gui.dll Qt5Widgets.dll libEGL.dll libGLESv2.dll opengl32sw.dll platforms/qwindows.dll
+          & 7z x -y "-o$runtime" $installer Qt5Core.dll Qt5Gui.dll Qt5Widgets.dll libEGL.dll libGLESv2.dll opengl32sw.dll platforms/qwindows.dll translations/lagos_de.qm translations/lagos_ja.qm translations/lagos_ru.qm
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "TS3_QT_TEST_DIR=$runtime" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
       - run: cmake -S . -B build -A x64 -DTS3_SDK_DIR="${{ github.workspace }}/.sdk"
