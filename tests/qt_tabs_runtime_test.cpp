@@ -64,6 +64,8 @@ int main(int argc, char** argv) {
         const auto barDestroy = symbol<void (*)(void*)>(widgets, "??1QTabBar@@UEAA@XZ");
         const auto addTab = symbol<int (*)(void*, const ghost::QtString*)>(widgets, "?addTab@QTabBar@@QEAAHAEBVQString@@@Z");
         const auto closable = symbol<void (*)(void*, bool)>(widgets, "?setTabsClosable@QTabBar@@QEAAX_N@Z");
+        const auto autoHide = symbol<void (*)(void*, bool)>(widgets, "?setAutoHide@QTabBar@@QEAAX_N@Z");
+        const auto setEnabled = symbol<void (*)(void*, bool)>(widgets, "?setEnabled@QWidget@@QEAAX_N@Z");
         const auto selectTab = symbol<void (*)(void*, int)>(widgets, "?setCurrentIndex@QTabBar@@QEAAXH@Z");
         const auto show = symbol<void (*)(void*)>(widgets, "?show@QWidget@@QEAAXXZ");
         const auto setName = symbol<void (*)(void*, const ghost::QtString*)>(core, "?setObjectName@QObject@@QEAAXAEBVQString@@@Z");
@@ -97,9 +99,24 @@ int main(int argc, char** argv) {
         require(!actions->closeCurrent(token, [] { return false; }), "reject a failed ownership guard");
         require(api.visible(&root), "failed ownership guard must not activate the close button");
         require(actions->closeCurrent(token, [] { return true; }), "invoke owned Qt close button");
-        std::cout << "Test inactive cleanup" << std::endl;
         require(!api.visible(&root), "close button signal must reach its receiver");
         require(api.token(first) == token, "QVariant token must round-trip exactly");
+        std::cout << "Test an auto-hidden single-server tab bar" << std::endl;
+        show(&root);
+        autoHide(&bar, true);
+        require(api.visible(&root) && !api.visible(&bar) && !api.visible(first),
+            "one server with auto-hide must hide its tab bar and close button");
+        require(!actions->closeCurrent(token, [] { return false; }) && api.visible(&root),
+            "a hidden tab must still honor the SDK ownership guard");
+        setEnabled(first, false);
+        require(!actions->closeCurrent(token, [] { return true; }) && api.visible(&root),
+            "a disabled hidden close button must not be invoked");
+        setEnabled(first, true);
+        require(actions->closeCurrent(token, [] { return true; }), "close an owned tab even when its bar is auto-hidden");
+        require(!api.visible(&root) && api.token(first) == token,
+            "the hidden enabled button must emit its signal and preserve the cleanup token");
+        autoHide(&bar, false); show(&bar);
+        std::cout << "Test inactive cleanup" << std::endl;
         show(&root);
         require(addTab(&bar, &text) == 1, "create second test tab");
         setName(api.tabButton(&bar, 1, 1), &name);

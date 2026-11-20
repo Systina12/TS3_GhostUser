@@ -8,7 +8,7 @@ Windows x64 的 TeamSpeak 3 原生 GUI 插件，用于在自有服务器上重�
 
 修复 0.1.0 遗漏 `ts3plugin_registerPluginID` 导致顶部 Plugins 菜单缺少入口的问题。官方 SDK 要求使用菜单时同时实现这个注册回调与 `ts3plugin_freeMemory`。回归检查现在覆盖注册 ID、复制临时 ID 缓冲区、创建菜单及卸载后清理的顺序。
 
-升级时完全退出 TS3，使用最新 DLL 替换旧版，再启动。在插件管理器中确认 Ghost User 已启用且版本为 0.1.5，然后打开顶部 Plugins 菜单。
+升级时完全退出 TS3，使用最新 DLL 替换旧版，再启动。在插件管理器中确认 Ghost User 已启用且版本为 0.1.6，然后打开顶部 Plugins 菜单。
 
 ## 0.1.2 时间参数
 
@@ -41,6 +41,12 @@ Windows x64 的 TeamSpeak 3 原生 GUI 插件，用于在自有服务器上重�
 保留 `guiConnect` 返回前到达的状态和服务器错误，取得新连接句柄后按顺序处理该句柄的回调，避免新标签页已经连接成功却被误报为恢复超时。旧标签页与其他标签页的回调不会用于确认新连接，失败调用的暂存事件会清除。
 
 GUI 忙碌期间收到“停止”会保存请求，在当前调用返回后执行；后台标签页清理返回后也会先处理停止，再推进批次，避免额外执行一次断网。关闭确认补上 TS3 使用的 `ServerViewManager` 翻译上下文，回归测试使用官方德语、日语、俄语翻译文件核对两种关闭对话框。
+
+## 0.1.6 单服务器隐藏标签栏修复
+
+TS3 仅有一个服务器标签页时可以自动隐藏标签栏，旧版误将关闭按钮不可见当成无法使用，导致勾选快速重连仍退回兼容路径，并在每轮等待旧连接清理。现在通过已核对的 Qt 控件直接请求关闭，支持自动隐藏的标签栏；仍检查当前测试连接、控件启用状态、关闭确认和后台清理标记。无法使用快速路径时，面板会区分未定位标签栏、主窗口被对话框阻塞、控件禁用等原因。
+
+Windows Qt 回归测试新增单标签页自动隐藏场景，验证隐藏按钮可以发出关闭信号，且连接核对失败或按钮禁用时不会操作。
 
 ## 验证状态
 
@@ -98,7 +104,7 @@ Linux 使用 Zig 0.13.0 交叉编译。打包前通过 binutils 的 `objdump` �
 ZIG=/path/to/zig TS3_SDK_DIR=/tmp/ts3-sdk bash tools/build_windows.sh
 ```
 
-产物为 `dist/ghostuser.dll`、带版本号的 ZIP（例如 `dist/GhostUser-v0.1.5-windows-x64.zip`）和 `dist/GhostUser-windows-x64.zip`。
+产物为 `dist/ghostuser.dll`、带版本号的 ZIP（例如 `dist/GhostUser-v0.1.6-windows-x64.zip`）和 `dist/GhostUser-windows-x64.zip`。
 
 Linux 本地验证：
 

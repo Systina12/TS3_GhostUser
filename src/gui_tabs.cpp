@@ -177,20 +177,39 @@ class QtGuiTabs final : public GuiTabActions {
 public:
     bool closeCurrent(std::uint64_t token, const Guard& guard) override {
         if (!api_.load()) { reason_ = api_.failure; return false; }
+        reason_ = "未定位到 TS3 服务器标签栏，使用兼容重连";
         for (const auto& found : serverBars(api_)) {
-            if (!IsWindowEnabled(found.window)) continue;
+            if (!IsWindowEnabled(found.window)) {
+                reason_ = "TS3 主窗口被对话框阻塞，使用兼容重连";
+                continue;
+            }
             const int index = api_.currentIndex(found.bar);
-            if (index < 0 || !guard()) continue;
+            if (index < 0 || !guard()) {
+                reason_ = "当前测试标签页未通过核对，使用兼容重连";
+                continue;
+            }
             auto* button = api_.tabButton(found.bar, index, 1); // RightSide
             if (!button) button = api_.tabButton(found.bar, index, 0);
-            if (!button || !api_.inherits(button, "QAbstractButton") || !api_.visible(button) || !api_.enabled(button)) continue;
+            if (!button || !api_.inherits(button, "QAbstractButton")) {
+                reason_ = "当前测试标签页缺少关闭控件，使用兼容重连";
+                continue;
+            }
+            if (!api_.enabled(button)) {
+                reason_ = "当前测试标签页关闭控件已禁用，使用兼容重连";
+                continue;
+            }
+            // TS3 can auto-hide the server bar when only one tab exists. Qt's
+            // click() works on an enabled hidden button; visibility is not ownership.
             api_.mark(button, token);
-            if (api_.token(button) != token) continue;
+            if (api_.token(button) != token) {
+                reason_ = "无法标记测试标签页以供后台清理，使用兼容重连";
+                continue;
+            }
+            reason_ = "未能完成测试标签页关闭请求，使用兼容重连";
             const bool result = close(found.window, guard, [&] { return api_.call(button, "click"); });
             if (result) reason_ = "快速重连：旧测试标签页已请求关闭，新连接使用新标签页";
             return result;
         }
-        reason_ = "未找到可确认的测试标签页关闭按钮，使用兼容重连";
         return false;
     }
     TabCleanup closeInactive(std::uint64_t token, const Guard& guard) override {
