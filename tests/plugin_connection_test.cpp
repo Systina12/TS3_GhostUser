@@ -341,6 +341,34 @@ int main() {
         require(details.find("secret-") == std::string::npos, "clipboard diagnostics must exclude both passwords");
     });
 #ifdef _WIN32
+    test("GUI tracks replacement handlers and can start another fast batch", [] {
+        Fixture f;
+        auto tabs = std::make_unique<TestTabs>(f.data);
+        host.setGuiTabs(std::move(tabs)); f.data.allowNewTabs = true;
+        module = GetModuleHandleW(nullptr); showWindow();
+        SetWindowTextW(countBox, L"2"); SetWindowTextW(gapBox, L"0"); SetWindowTextW(holdBox, L"0");
+        const auto timer = [&] { SendMessageW(window, WM_TIMER, timerId, 0); };
+        SendMessageW(window, WM_COMMAND, MAKEWPARAM(startId, BN_CLICKED), 0);
+        timer();
+        f.data.tabs[1].address = "127.0.0.1"; f.data.tabs[1].port = 40111;
+        f.data.event(1, STATUS_CONNECTING); f.data.event(1, STATUS_CONNECTION_ESTABLISHED);
+        timer(); timer(); timer(); timer();
+        const auto second = controller->handler();
+        require(second == 3 && selected.handler == second, "GUI selection must follow the new test handler");
+        f.data.tabs[second].address = "127.0.0.1"; f.data.tabs[second].port = 40111;
+        f.data.event(second, STATUS_CONNECTING); f.data.event(second, STATUS_CONNECTION_ESTABLISHED);
+        timer(); timer(); timer(); timer();
+        const auto restored = controller->handler();
+        require(restored == 4, "final restore must also replace the handler");
+        f.data.event(restored, STATUS_CONNECTING); f.data.event(restored, STATUS_CONNECTION_ESTABLISHED);
+        timer(); timer();
+        require(!controller->running() && selected.handler == restored, "finished GUI selection must retain the final handler");
+        SendMessageW(window, WM_COMMAND, MAKEWPARAM(startId, BN_CLICKED), 0);
+        require(controller->running(), "another batch must start without a stale-handler error");
+        f.data.event(1, STATUS_DISCONNECTED); f.data.event(second, STATUS_DISCONNECTED);
+        host.collectRetiredTabs();
+        ts3plugin_shutdown();
+    });
     test("GUI blocks refresh, start and restore until cancellation completes", [] {
         Fixture f;
         module = GetModuleHandleW(nullptr);

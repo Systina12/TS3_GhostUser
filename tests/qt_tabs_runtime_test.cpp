@@ -114,6 +114,9 @@ int main(int argc, char** argv) {
         require(!api.visible(&root), "typed int signal must reach its receiver");
         require(actions->closeInactive(token + 1, [] { return true; }) == ghost::TabCleanup::missing,
             "unrelated tabs must not match another token");
+        const auto disconnect = symbol<bool (*)(const void*, const char*, const void*, const char*)>(core,
+            "?disconnect@QObject@@SA_NPEBV1@PEBD01@Z");
+        require(disconnect(&bar, "2tabCloseRequested(int)", &root, "1hide()"), "remove the synthetic cleanup receiver");
         std::cout << "Test owned close confirmation" << std::endl;
         const auto messageConstruct = symbol<void (*)(void*, void*)>(widgets, "??0QMessageBox@@QEAA@PEAVQWidget@@@Z");
         const auto messageDestroy = symbol<void (*)(void*)>(widgets, "??1QMessageBox@@UEAA@XZ");
@@ -135,6 +138,7 @@ int main(int argc, char** argv) {
         require(dialogResult(&dialog) == 0x4000, "the close dialog must receive Yes");
         api.stringConstruct(&title, L"Unrecognized confirmation", 25);
         setTitle(&dialog, &title); api.stringDestroy(&title);
+        show(&root);
         require(!actions->closeCurrent(token + 3, [] { return true; }), "decline an unrecognized confirmation");
         require(dialogResult(&dialog) == 0x10000, "an unrecognized confirmation must receive No");
         messageDestroy(&dialog);

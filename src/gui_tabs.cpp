@@ -161,7 +161,7 @@ void CALLBACK confirmClose(HWND, UINT, UINT_PTR, DWORD) {
         GetWindowTextW(window, title, 512);
         const bool recognized = std::find(attempt.titles.begin(), attempt.titles.end(), title) != attempt.titles.end();
         const bool accept = recognized && attempt.guard();
-        attempt.cancelled = !accept;
+        attempt.cancelled = attempt.cancelled || !accept;
         // Invoke the standard Yes/No button without changing "Do not show again".
         attempt.api.call(accept ? yes : no, "click", 2); // QueuedConnection
         attempt.handled = window;
@@ -178,6 +178,7 @@ public:
     bool closeCurrent(std::uint64_t token, const Guard& guard) override {
         if (!api_.load()) { reason_ = api_.failure; return false; }
         for (const auto& found : serverBars(api_)) {
+            if (!IsWindowEnabled(found.window)) continue;
             const int index = api_.currentIndex(found.bar);
             if (index < 0 || !guard()) continue;
             auto* button = api_.tabButton(found.bar, index, 1); // RightSide
@@ -200,7 +201,7 @@ public:
                 auto* button = api_.tabButton(found.bar, index, 1);
                 if (!button) button = api_.tabButton(found.bar, index, 0);
                 if (!button || api_.token(button) != token) continue;
-                if (index == api_.currentIndex(found.bar) || !guard()) return TabCleanup::kept;
+                if (!IsWindowEnabled(found.window) || index == api_.currentIndex(found.bar) || !guard()) return TabCleanup::kept;
                 const bool result = close(found.window, guard, [&] {
                     return api_.call(found.bar, "tabCloseRequested", 1, {&index, "int"});
                 });
