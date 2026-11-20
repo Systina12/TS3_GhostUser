@@ -114,6 +114,30 @@ int main(int argc, char** argv) {
         require(!api.visible(&root), "typed int signal must reach its receiver");
         require(actions->closeInactive(token + 1, [] { return true; }) == ghost::TabCleanup::missing,
             "unrelated tabs must not match another token");
+        std::cout << "Test owned close confirmation" << std::endl;
+        const auto messageConstruct = symbol<void (*)(void*, void*)>(widgets, "??0QMessageBox@@QEAA@PEAVQWidget@@@Z");
+        const auto messageDestroy = symbol<void (*)(void*)>(widgets, "??1QMessageBox@@UEAA@XZ");
+        const auto standardButtons = symbol<void (*)(void*, unsigned)>(widgets,
+            "?setStandardButtons@QMessageBox@@QEAAXV?$QFlags@W4StandardButton@QMessageBox@@@@@Z");
+        const auto setTitle = symbol<void (*)(void*, const ghost::QtString*)>(widgets, "?setWindowTitle@QWidget@@QEAAXAEBVQString@@@Z");
+        const auto dialogResult = symbol<int (*)(const void*)>(widgets, "?result@QDialog@@QEBAHXZ");
+        Storage dialog;
+        messageConstruct(&dialog, &root);
+        standardButtons(&dialog, 0x4000 | 0x10000);
+        ghost::QtString title;
+        api.stringConstruct(&title, L"Disconnect from Server", 22);
+        setTitle(&dialog, &title); api.stringDestroy(&title);
+        auto* second = api.tabButton(&bar, 1, 1);
+        connect(&connection, second, "2clicked(bool)", &dialog, "1exec()", 1);
+        connectionDestroy(&connection);
+        show(&root);
+        require(actions->closeCurrent(token + 2, [] { return true; }), "recognize the owned close dialog");
+        require(dialogResult(&dialog) == 0x4000, "the close dialog must receive Yes");
+        api.stringConstruct(&title, L"Unrecognized confirmation", 25);
+        setTitle(&dialog, &title); api.stringDestroy(&title);
+        require(!actions->closeCurrent(token + 3, [] { return true; }), "decline an unrecognized confirmation");
+        require(dialogResult(&dialog) == 0x10000, "an unrecognized confirmation must receive No");
+        messageDestroy(&dialog);
         api.stringDestroy(&name); api.stringDestroy(&text);
         std::cout << "Destroy test widgets" << std::endl;
         barDestroy(&bar); widgetDestroy(&root); applicationDestroy(&application);
