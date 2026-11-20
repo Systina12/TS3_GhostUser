@@ -1,0 +1,39 @@
+name: build
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamspeak/ts3client-pluginsdk
+          ref: 4aa90a53aa150cbf81e13bc97e68c0431b26499f
+          path: .sdk
+      - run: make test TS3_SDK_DIR="$GITHUB_WORKSPACE/.sdk"
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamspeak/ts3client-pluginsdk
+          ref: 4aa90a53aa150cbf81e13bc97e68c0431b26499f
+          path: .sdk
+      - run: cmake -S . -B build -A x64 -DTS3_SDK_DIR="${{ github.workspace }}/.sdk"
+      - run: cmake --build build --config Release
+      - name: Verify the DLL loads and its menu opens a window offline
+        run: ctest --test-dir build -C Release -R "^plugin_menu_smoke$" --no-tests=error --output-on-failure
+      - run: ctest --test-dir build -C Release -E "^plugin_menu_smoke$" --no-tests=error --output-on-failure
+      - shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Copy-Item build/Release/ghostuser.dll dist/ghostuser.dll
+          python tools/package.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GhostUser-windows-x64
+          path: dist/GhostUser-windows-x64.zip
+          if-no-files-found: error
